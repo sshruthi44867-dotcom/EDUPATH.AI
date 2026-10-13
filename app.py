@@ -29,13 +29,104 @@ div[data-testid="stMetric"] {
 </style>
 """, unsafe_allow_html=True)
 
-# SAMPLE DATA LOAD
-@st.cache_data
+# STUDENT DATA LOAD (CSV FIRST; DEMO DATA ONLY IF NO CSV EXISTS)
+REQUIRED_COLUMNS = ["Student_ID", "Department", "Attendance", "Marks", "Assignments", "Study_Hours"]
+FEATURES = ["Attendance", "Marks", "Assignments", "Study_Hours"]
+
+def prepare_student_data(raw_df):
+    """Standardize common CSV column names and validate student data."""
+    df = raw_df.copy()
+    df.columns = [str(c).strip().replace(" ", "_").replace("-", "_") for c in df.columns]
+
+    aliases = {
+        "studentid": "Student_ID", "student_id": "Student_ID", "id": "Student_ID",
+        "department": "Department", "dept": "Department",
+        "attendance": "Attendance", "attendance_percentage": "Attendance",
+        "marks": "Marks", "mark": "Marks", "score": "Marks",
+        "assignments": "Assignments", "assignment": "Assignments",
+        "study_hours": "Study_Hours", "studyhours": "Study_Hours",
+        "risk": "Risk_Label", "risk_label": "Risk_Label"
+    }
+    rename = {}
+    for col in df.columns:
+        key = col.lower().replace("_", "")
+        if key in ("studentid", "id"):
+            rename[col] = "Student_ID"
+        elif key in ("department", "dept"):
+            rename[col] = "Department"
+        elif key in ("attendance", "attendancepercentage"):
+            rename[col] = "Attendance"
+        elif key in ("marks", "mark", "score"):
+            rename[col] = "Marks"
+        elif key in ("assignments", "assignment"):
+            rename[col] = "Assignments"
+        elif key in ("studyhours",):
+            rename[col] = "Study_Hours"
+        elif key in ("risk", "risklabel"):
+            rename[col] = "Risk_Label"
+    df = df.rename(columns=rename)
+
+    if "Student_ID" not in df.columns:
+        df["Student_ID"] = [f"STU{i:03d}" for i in range(1, len(df) + 1)]
+    if "Department" not in df.columns:
+        df["Department"] = "General"
+
+    for col in ["Attendance", "Marks", "Assignments", "Study_Hours"]:
+        if col not in df.columns:
+            if col == "Assignments":
+                df[col] = pd.to_numeric(df.get("Marks", 0), errors="coerce")
+            elif col == "Study_Hours":
+                df[col] = 0
+            else:
+                raise ValueError(
+                    f"CSV-la '{col}' column illa. Required columns: Student_ID, Department, "
+                    "Attendance, Marks. Column names check pannunga."
+                )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["Attendance", "Marks"]).copy()
+    if df.empty:
+        raise ValueError("CSV-la valid student rows illa. Attendance and Marks numeric-a irukkanum.")
+
+    df["Assignments"] = df["Assignments"].fillna(df["Assignments"].median() if df["Assignments"].notna().any() else 0)
+    df["Study_Hours"] = df["Study_Hours"].fillna(df["Study_Hours"].median() if df["Study_Hours"].notna().any() else 0)
+    df["Department"] = df["Department"].fillna("General").astype(str)
+    df["Student_ID"] = df["Student_ID"].fillna("").astype(str)
+
+    if "Risk_Label" not in df.columns:
+        score = (
+            0.4 * (100 - df["Attendance"].clip(0, 100))
+            + 0.35 * (100 - df["Marks"].clip(0, 100))
+            + 0.25 * (100 - df["Assignments"].clip(0, 100))
+        )
+        df["Risk_Label"] = np.where(score >= 48, "High", np.where(score >= 30, "Medium", "Low"))
+    else:
+        df["Risk_Label"] = df["Risk_Label"].astype(str).str.title()
+        valid_labels = {"High", "Medium", "Low"}
+        df.loc[~df["Risk_Label"].isin(valid_labels), "Risk_Label"] = "Medium"
+
+    return df.reset_index(drop=True)
+
+
 def load_data():
+    # Admin-uploaded data takes priority for this session.
+    uploaded_df = st.session_state.get("uploaded_students_df")
+    if uploaded_df is not None:
+        return prepare_student_data(uploaded_df)
+
+    # GitHub / Streamlit Cloud filenames are case-sensitive.
+    for filename in ["Students.csv", "students.csv", "students_data.csv"]:
+        try:
+            if __import__("os").path.exists(filename):
+                return prepare_student_data(pd.read_csv(filename))
+        except Exception as exc:
+            st.error(f"{filename} read panna mudiyala: {exc}")
+
+    # Keep the app usable if no CSV has been committed yet.
+    st.warning("Students.csv file kidaikkala. Ippo demo data use aagudhu. Real student data-ku Students.csv upload/commit pannunga.")
     rng = np.random.default_rng(42)
     n = 150
-
-    df = pd.DataFrame({
+    demo = pd.DataFrame({
         "Student_ID": [f"STU{i:03d}" for i in range(1, n + 1)],
         "Department": rng.choice(["CSE", "ECE", "IT", "Mechanical"], size=n),
         "Attendance": rng.integers(40, 101, n),
@@ -43,32 +134,24 @@ def load_data():
         "Assignments": rng.integers(20, 101, n),
         "Study_Hours": rng.integers(1, 7, n)
     })
+    return prepare_student_data(demo)
 
-    score = (
-        0.4 * (100 - df["Attendance"])
-        + 0.35 * (100 - df["Marks"])
-        + 0.25 * (100 - df["Assignments"])
-    )
-
-    df["Risk_Label"] = np.where(
-        score >= 48, "High",
-        np.where(score >= 30, "Medium", "Low")
-    )
-
-    return df
 
 df = load_data()
-FEATURES = ["Attendance", "Marks", "Assignments", "Study_Hours"]
 
-# DEMO AI MODEL
-@st.cache_resource
-def train_model():
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(df[FEATURES], df["Risk_Label"])
-    return model
-
-model = train_model()
+# Train from the currently loaded dataset; avoid stale cached models after CSV upload.
+score = (
+    0.4 * (100 - df["Attendance"].clip(0, 100))
+    + 0.35 * (100 - df["Marks"].clip(0, 100))
+    + 0.25 * (100 - df["Assignments"].clip(0, 100))
+)
+df["Risk_Label"] = df["Risk_Label"].fillna(
+    pd.Series(np.where(score >= 48, "High", np.where(score >= 30, "Medium", "Low")), index=df.index)
+)
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(df[FEATURES], df["Risk_Label"])
 df["Risk"] = model.predict(df[FEATURES])
+
 
 # SESSION STATE MANAGEMENT
 if "logged_in" not in st.session_state:
@@ -231,13 +314,13 @@ else:
 
         elif "My Profile" in page:
             st.title("👤 My Profile & AI Analytics (Editable)")
-            
+
             with st.form("edit_profile_form"):
                 name = st.text_input("📝 Full Name", st.session_state["student_profile"]["Name"])
                 email = st.text_input("📧 Email Address", st.session_state["student_profile"]["Email"])
                 phone = st.text_input("📞 Contact Number", st.session_state["student_profile"]["Phone"])
                 address = st.text_area("🏠 Address", st.session_state["student_profile"]["Address"])
-                
+
                 update_btn = st.form_submit_button("✨ Update Profile")
                 if update_btn:
                     st.session_state["student_profile"]["Name"] = name
@@ -272,12 +355,12 @@ else:
         elif "Student Feedback" in page:
             st.title("💬 Subject-wise Student Feedback")
             st.write("📝 Share your thoughts to help improve teaching quality and lab sessions:")
-            
+
             with st.form("subject_feedback_form"):
                 sub_selected = st.selectbox("📚 Select Subject", ["Data Structures", "AI & Machine Learning", "Database Systems", "Computer Networks", "Web Tech"])
                 feedback_category = st.selectbox("🏷️ Feedback Category", ["Teaching Quality", "Lab Infrastructure", "Course Material", "General"])
                 feedback_text = st.text_area("✍️ Write your feedback or suggestions:")
-                
+
                 submit_fb = st.form_submit_button("🚀 Submit Feedback")
                 if submit_fb:
                     st.session_state["student_feedback_list"].append({
@@ -293,7 +376,7 @@ else:
 
         elif "Academic Challenges" in page:
             st.title("⚠️ Report Academic Challenges (Editable)")
-            
+
             with st.form("challenge_form"):
                 ch_sub = st.selectbox("📚 Select Subject", ["Data Structures", "AI & ML", "Database Systems", "Networks"])
                 ch_desc = st.text_area("✍️ Describe the concept or topic you find difficult:")
@@ -332,13 +415,13 @@ else:
 
         elif "Internship Participation" in page:
             st.title("🏆 Internship Participation & Certificate Upload")
-            
+
             with st.form("internship_form"):
                 company_name = st.text_input("🏢 Company Name")
                 role_title = st.text_input("💼 Internship Role")
                 duration = st.text_input("⏱️ Duration (e.g., 2 Months)")
                 cert_file = st.file_uploader("📁 Upload Certificate File", type=["pdf", "png", "jpg"])
-                
+
                 submit_intern = st.form_submit_button("💾 Save Internship Details")
                 if submit_intern:
                     st.session_state["student_internships"].append({
@@ -481,9 +564,21 @@ else:
                 st.info("ℹ️ No subject feedback submitted by students yet.")
 
         elif "13. 📁 Upload CSV / Export" in admin_page:
-            up = st.file_uploader("📁 Upload New CSV Dataset", type=["csv"])
-            if up:
-                st.success("🎉 Dataset uploaded and synchronized successfully!")
+            st.write("Upload a student CSV with at least Attendance and Marks columns.")
+            up = st.file_uploader("📁 Upload New CSV Dataset", type=["csv"], key="student_csv_upload")
+            if up is not None:
+                try:
+                    uploaded_df = pd.read_csv(up)
+                    checked_df = prepare_student_data(uploaded_df)
+                    st.session_state["uploaded_students_df"] = checked_df.drop(
+                        columns=["Risk", "Risk_Label"], errors="ignore"
+                    )
+                    st.success(f"CSV validated: {len(checked_df)} student records loaded. Click below to apply.")
+                    st.dataframe(checked_df, use_container_width=True, hide_index=True)
+                    if st.button("🔄 Apply Uploaded Dataset"):
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"CSV upload failed: {exc}")
 
         elif "14. 📑 Reports & PDF Export" in admin_page:
             st.download_button("📥 Export Institutional Report (CSV)", data=df.to_csv().encode('utf-8'), file_name="edupath_report.csv")
